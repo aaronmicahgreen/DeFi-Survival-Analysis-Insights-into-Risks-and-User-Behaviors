@@ -1,0 +1,588 @@
+---
+title: "MARBLE2022 Work"
+author: "Aaron Micah Green"
+date: "3/8/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+# Set the default CRAN repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+# Set code chunk defaults
+knitr::opts_chunk$set(echo = TRUE)
+
+# Load required packages; install if necessary
+# CAUTION: DO NOT interrupt R as it installs packages!!
+if (!require("ggplot2")) {
+  install.packages("ggplot2")
+  library(ggplot2)
+}
+
+if (!require("knitr")) {
+  install.packages("knitr")
+  library(knitr)
+}
+
+if (!require("dplyr")) {
+  install.packages("dplyr")
+  library(dp)
+}
+
+if (!require("RColorBrewer")) {
+  install.packages("RColorBrewer")
+  library(RColorBrewer)
+}
+if (!require("beeswarm")) {
+  install.packages("beeswarm")
+  library(beeswarm)
+}
+if (!require("tidyverse")) {
+  install.packages("tidyverse")
+  library(tidyverse)
+}
+if (!require("ggbeeswarm")) {
+  install.packages("ggbeeswarm")
+  library(ggbeeswarm)
+}
+if (!require("xts")) {
+  install.packages("xts")
+  library(xts)
+}
+if (!require("plotly")) {
+  install.packages("plotly")
+  library(plotly)
+}
+if(!require("lubridate")) {
+  install.packages("lubridate")
+  library(lubridate)
+}
+if(!require("survival")) {
+  install.packages("survival")
+  library(survival)
+}
+if(!require("survminer")) {
+  install.packages('survminer')
+  library(survminer)
+}
+if(!require("ranger")){
+  install.packages("ranger")
+  library(ranger)
+}
+if(!require("ggfortify")){
+  install.packages("ggfortify")
+  library(ggfortify)
+}
+
+source("loadData.r")
+```
+# Convert Data to Appropriate Format for Survival Analysis
+  For tracking loans we can filter out all but a few features of the data:
+  
+```{r}
+timeFinal <- max(df$timestamp)
+
+# Build a table of transaction summary statistics:
+transactionSummaries <- df %>%
+  group_by(type) %>%
+  summarise(count = n(), meanValue = mean(amountUSD), medianValue = median(amountUSD), meanPrinciaplAmount = mean(amountUSDPrincipal), meanCollateralAmount = mean(amountUSDCollateral))
+
+coinSummaries <- df %>%
+  group_by(reserve, type) %>%
+  summarise(count = n(), totalValue = sum(amountUSD), stableCoin) %>%
+  distinct()
+```
+
+## Any-To-Any Setup:
+```{r}
+anyToAny <- df %>%
+  group_by(user) %>%
+  arrange(timestamp) %>%
+  mutate(nextTransactionTimestamp = lead(timestamp), nextTransactionType = lead(type), nextTransactionReserve = lead(reserve)) %>%
+  mutate(timeDiff = case_when(!is.na(nextTransactionTimestamp) ~ nextTransactionTimestamp - timestamp,
+         TRUE ~ timestamp - timeFinal)) %>%
+  mutate(status = case_when(timeDiff < 0 ~ 0, timeDiff >= 0 ~ 1)) %>%
+  mutate(timeDiff = abs(timeDiff)) %>%
+  select(user, reserve, type, timeDiff, status, nextTransactionType, nextTransactionReserve) %>%
+  ungroup()
+
+anyToAnyFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ type, data = anyToAny)
+
+anyToAnyPlot <- ggsurvplot(anyToAnyFit, censor = FALSE)
+
+anyToAnyPlot
+
+anyToAny <- anyToAny %>%
+  mutate(nextTransactionBorrow = (nextTransactionType == "borrow")) %>%
+  mutate(nextTransactionCollateral = (nextTransactionType == "collateral")) %>%
+  mutate(nextTransactionDeposit = (nextTransactionType == "deposit")) %>%
+  mutate(nextTransactionLiquidation = (nextTransactionType == "liquidation")) %>%
+  mutate(nextTransactionRedeem = (nextTransactionType == "redeem")) %>%
+  mutate(nextTransactionRepay = (nextTransactionType == "repay")) %>%
+  mutate(nextTransactionSwap = (nextTransactionType == "swap")) 
+
+```
+
+## Deposit-to-Any Analysis:
+```{r}
+depositToAny <- anyToAny %>%
+  filter(type == "deposit")
+
+numTypesAfterDeposit <- depositToAny %>%
+  group_by(nextTransactionType) %>%
+  summarise(count = n()) %>%
+  mutate(percentage = count*100 / length(deposits$timestamp))
+
+kable(numTypesAfterDeposit)
+  
+
+depositToAnyFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ nextTransactionType, data=depositToAny)
+
+depositToAnyPlot <- ggsurvplot(depositToAnyFit, xlab = "Time (days)", ylab = "Probability of No Subsequent Transactions", censor = FALSE, legend = c(0.8,0.6), legend.title = "Next Transaction Type (Percentage)", legend.labs = c("Borrow (10.74%)", "Collateral (32.62%)", "Deposit (27.11%)", "Liquidation (0.22%)", "Redeem (25.69%)", "Repay (2.68%)", "Swap (0.13%)"), xlim = c(0,50), break.time.by = 5, conf.int = TRUE, pval = TRUE, pval.coord = c(10, 0.5))
+
+depositToAnyPlot
+```
+```{r}
+depositToAnyFitHours <- survfit(Surv(as.numeric(timeDiff/3600), as.numeric(status)) ~ nextTransactionType, data=depositToAny)
+
+depositToAnyMedians <- surv_median(depositToAnyFitHours)
+
+kable(depositToAnyMedians)
+
+median(depositToAny$timeDiff) / 3600
+
+depositToAnyCox <- coxph(Surv(as.numeric(timeDiff/3600), as.numeric(status)) ~ nextTransactionBorrow + nextTransactionCollateral + nextTransactionDeposit + nextTransactionLiquidation + nextTransactionRedeem + nextTransactionRepay + nextTransactionSwap, data = depositToAny)
+summary(depositToAnyCox)
+```
+
+
+## Borrow to Any Analysis:
+```{r}
+borrowToAny <- anyToAny %>%
+  filter(type == "borrow")
+
+borrowToAnyFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ nextTransactionType, data=borrowToAny)
+
+borrowToAnyPlot <- ggsurvplot(borrowToAnyFit, xlab = "Time (days)", ylab = "Probability of No Subsequent Transactions", title = "How Quickly Do Users Act After Borrowing Funds?", censor = FALSE, legend = c(0.8,0.6), legend.title = "Next Transaction Type", legend.labs = c("Borrow", "Collateral", "Deposit", "Liquidation", "Redeem", "Repay", "Swap"), xlim = c(0,50), break.time.by = 5)
+
+borrowToAnyPlot
+```
+## Borrow to Repay Analysis:
+```{r}
+borrows <- borrows %>%
+  mutate(ID = row_number())
+
+borrowsToRepays <- left_join(borrows, repays, by = c("user", "reserve")) %>%
+  rename(borrowTime = timestamp.x) %>%
+  rename(repayTime = timestamp.y) %>%
+  group_by(ID) %>%
+  mutate(status = case_when(borrowTime >= max(repayTime) ~ 0,
+                            is.na(repayTime) ~ 0,
+                            TRUE ~ 1)) %>%
+  distinct()
+         
+censoredBorrows <- borrowsToRepays %>%
+  filter(status == 0) %>%
+  group_by(ID) %>%
+  summarise(ID, user, timeDiff = timeFinal - borrowTime, status, reserve) %>%
+  distinct()
+  
+uncensoredBorrows <- borrowsToRepays %>%
+  filter(status == 1) %>%
+  filter(repayTime > borrowTime) %>%
+  summarise(ID, user, timeDiff = min(repayTime) - borrowTime, status, reserve) %>%
+  distinct()
+
+allBorrowsToRepays <- bind_rows(censoredBorrows, uncensoredBorrows) %>%
+  arrange(ID)
+  
+
+borrowToRepayFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ 1, data=allBorrowsToRepays)
+
+borrowToRepayPlot <- ggsurvplot(borrowToRepayFit, xlab = "Time (days)", ylab = "Probability of No Repayments", title="How Long Do Users Wait to Repay Loans?", legend = "none", censor=FALSE)
+
+borrowToRepayPlot
+
+```
+
+```{r}
+borrowsToRepaysStable <- allBorrowsToRepays %>%
+  left_join(reserveTypes) %>%
+  filter(reserveType == "Stable")
+
+borrowsToRepaysStableFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ reserve, data=borrowsToRepaysStable)
+
+borrowsToRepaysStablePlot <- ggsurvplot(borrowsToRepaysStableFit, xlab="Time (days)", ylab="Probability of No Repays", title="How Long Do Users Wait to Repay Stable Coins?", legend.title="", censor=FALSE, conf.int = FALSE)
+
+borrowsToRepaysStablePlot
+```
+
+```{r}
+borrowsToRepaysNonStable <- allBorrowsToRepays %>%
+  left_join(reserveTypes) %>%
+  filter(reserveType == "Non-Stable")
+
+borrowsToRepaysNonStableFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ reserve, data=borrowsToRepaysNonStable)
+
+borrowsToRepaysNonStablePlot <- ggsurvplot(borrowsToRepaysNonStableFit, xlab="Time (days)", ylab="Probability of No Repays", title="How Long Do Users Wait to Repay Non-Stable Coins?", legend.title="", censor=FALSE, conf.int = FALSE)
+
+borrowsToRepaysNonStablePlot
+```
+
+```{r}
+borrowsToRepaysSplit <- allBorrowsToRepays %>%
+  left_join(reserveTypes)
+
+borrowsToRepaysSplitFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ reserveType, data=borrowsToRepaysSplit)
+
+borrowsToRepaysSplitPlot <- ggsurvplot(borrowsToRepaysSplitFit, xlab="Time (days)", ylab="Probability of No Repays", censor=FALSE, legend.title = "Coin Type", legend.labs = c("Non-Stable (15.40%)", "Stable (84.60%)"), legend = c(0.8, 0.7), pval = TRUE, conf.int = TRUE, xlim = c(0, 10))
+
+borrowsToRepaysSplitPlot
+```
+
+```{r}
+allBorrowsToRepaysNoNA <- allBorrowsToRepays %>%
+  filter(status == 1)
+km_fitAllCoins <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status))~reserve, data=allBorrowsToRepaysNoNA)
+medianTimeToRepay <- surv_median(km_fitAllCoins)%>%
+  mutate(reserve = str_sub(strata, start=9))%>%
+  left_join(reserveTypes)
+
+kable(medianTimeToRepay)
+
+densityPlotTimeToRepay <- medianTimeToRepay  %>%
+  ggplot(aes(x=median, color=reserveType)) + geom_density() +
+  xlab("Time Elapsed Before Loan Repayment (in Days)") +
+  ylab("Proportion of Users") + theme_classic() +
+  labs(color = "Coin Type") + theme(legend.position = c(0.8, 0.5))
+
+densityPlotTimeToRepay
+```
+
+## Borrow To Liquidation Analysis:
+```{r}
+borrowsToLiquidations <- left_join(borrows, liquidations, by = c("user")) %>%
+  rename(borrowTime = timestamp.x) %>%
+  rename(liquidationTime = timestamp.y) %>%
+  group_by(ID) %>%
+  mutate(status = case_when(borrowTime >= max(liquidationTime) ~ 0,
+                            is.na(liquidationTime) ~ 0,
+                            TRUE ~ 1)) %>%
+  distinct()
+         
+censoredBorrowsToLiquidations <- borrowsToLiquidations %>%
+  filter(status == 0) %>%
+  group_by(ID) %>%
+  summarise(ID, user, timeDiff = timeFinal - borrowTime, status, reserve) %>%
+  distinct()
+  
+uncensoredBorrowsToLiquidations <- borrowsToLiquidations %>%
+  filter(status == 1) %>%
+  filter(liquidationTime > borrowTime) %>%
+  summarise(ID, user, timeDiff = min(liquidationTime) - borrowTime, status, reserve) %>%
+  distinct()
+
+allBorrowsToLiquidations <- bind_rows(censoredBorrowsToLiquidations, uncensoredBorrowsToLiquidations) %>%
+  arrange(ID)
+  
+
+borrowToLiquidationsFit <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ 1, data=allBorrowsToLiquidations)
+
+borrowToLiquidationPlot <- ggsurvplot(borrowToLiquidationsFit, xlab = "Time (days)", ylab = "Probability of No Repayments", title="How Long Do Loans Last Before Being Liquidated?", legend = "none", censor=FALSE)
+
+borrowToLiquidationPlot
+```
+
+
+```{r}
+# Here we set up a survival curve representing all borrows. Any borrow that is followed at any time by the user being liquidated counts as a "death". Any borrow after which no liquidation has yet occurred for the same user is considered censored.
+borrows <- borrows %>%
+  mutate(ID = row_number())
+borrowsThatLiquidated <- left_join(borrows, liquidations, by = c("user", "reserve" = "principalReserve")) %>%
+  rename(borrowTime = timestamp.x) %>%
+  rename(liquidationTime = timestamp.y) %>%
+  group_by(user, borrowTime) %>%
+  slice_min(liquidationTime) %>%
+  ungroup() %>%
+  rename(principalReserve = reserve)
+  
+borrowsToLiquidations <- left_join(borrows, borrowsThatLiquidated, by = "ID") %>%
+  mutate(borrowTime = timestamp, borrowedReserve = reserve) %>%
+  select(ID, borrowTime, liquidationTime, principalReserve, collateralReserve, borrowedReserve) %>%
+  mutate(timeDiff = case_when(!is.na(liquidationTime) ~ liquidationTime - borrowTime,
+                              TRUE ~ borrowTime - timeFinal)) %>%
+  mutate(status = case_when(timeDiff <= 0 ~ 0, TRUE ~ 1)) %>%
+  mutate(timeDiff = abs(timeDiff)) %>%
+  distinct()
+
+borrowsToLiquidationTypes <- left_join(borrowsToLiquidations, reserveTypes, by = c("principalReserve" = "reserve")) %>%
+  rename('principalType' = 'reserveType')%>%
+  left_join(reserveTypes, by = c("collateralReserve" = "reserve")) %>%
+  rename(collateralType = reserveType) %>%
+  left_join(reserveTypes, by = c("borrowedReserve" = "reserve")) %>%
+  rename(borrowType = reserveType)
+  
+borrowTypePercentages <- borrowsToLiquidationTypes %>%
+  group_by(borrowType) %>%
+  summarise(count = n(), count*100 / 124899)
+
+borrowTypePercentages
+
+borrowsToLiquidationsFit <- survfit(Surv(timeDiff/86400, status) ~ borrowType, data=borrowsToLiquidationTypes)
+
+borrowsToLiquidationsPlot <- ggsurvplot(borrowsToLiquidationsFit, xlab="Time (days)", ylab="Probability of No Liquidation", legend.title="Coin Type", censor=FALSE, conf.int = TRUE, legend.labs = c("Non-Stable (15.40%)", "Stable (84.60%)"), legend = c(0.8,0.6), pval = TRUE)
+
+
+borrowsToLiquidationsPlot
+
+
+```
+```{r}
+borrowsToLiquidationTypesNoNA <- borrowsToLiquidationTypes %>%
+  filter(!is.na(liquidationTime))
+borrowsToLiquidationsMediansFit<- survfit(Surv(timeDiff/86400, status) ~ borrowedReserve, data=borrowsToLiquidationTypesNoNA)
+medianTimeToLiquidation <- surv_median(borrowsToLiquidationsMediansFit) %>%
+  arrange(median) %>%
+  mutate(reserve = str_sub(strata, start=17))%>%
+  left_join(reserveTypes, by = "reserve")
+
+
+densityPlotTimeToLiquidation <- medianTimeToLiquidation  %>%
+  ggplot(aes(x=median, color=reserveType)) + geom_density() +
+  xlab("Time Elapsed Before Loan Liquidation (in Days)") +
+  ylab("Proportion of Users") + theme_classic() +
+  labs(color = "Coin Type") +
+  theme(legend.position = c(0.8,0.5))
+
+densityPlotTimeToLiquidation
+
+```
+
+```{r}
+numAggregateLiqPerUser <- aggregateLiquidations %>%
+  group_by(user) %>%
+  dplyr::summarise(user_alias, numLiquidations = n()) %>%
+  distinct()
+
+loanDataTimeToLiquidate <- left_join(borrows,aggregateLiquidations,by=c("user")) %>%
+  dplyr::rename(borrowTime=timestamp) %>%
+  dplyr::rename(liquidationTime=liquidationStart) %>%
+  group_by(user) %>%
+  filter(borrowTime <= liquidationTime) %>%
+  mutate(timeDiff=case_when(min(liquidationTime)-min(borrowTime)>0 ~ min(liquidationTime)-min(borrowTime), 
+                                      TRUE ~ borrowTime - timeFinal)) %>%
+  mutate(status=case_when(timeDiff<=0 ~ 0, timeDiff>0 ~ 1)) %>%
+  mutate(timeDiff = abs(timeDiff))%>%
+  select(user,reserve,principalReserves,collateralReserves,principalTypes,collateralTypes,liquidationType,timeDiff,status) %>%
+  distinct()
+
+loanDataTimeToLiquidate <- left_join(loanDataTimeToLiquidate, reserveTypes, by="reserve") %>%
+  mutate(liquidationType2 = if_else(!is.na(collateralTypes), paste(reserveType, collateralTypes, sep=":"), "NA"))
+
+loanDataTimeToLiquidate$liquidationType2 <- na_if(loanDataTimeToLiquidate$liquidationType2, "NA")
+
+liquidationCounts <- loanDataTimeToLiquidate %>%
+  group_by(liquidationType2) %>%
+  dplyr::summarise(liquidationCount = n(), percent = liquidationCount*100 / 6587) %>%
+  arrange(-liquidationCount)
+
+liquidationCounts
+
+```
+
+```{r}
+loanDataTimeToLiquidate$principalTypes <- as.factor(loanDataTimeToLiquidate$principalTypes)
+
+loanDataTimeToLiquidate$principalTypes <- fct_relevel(loanDataTimeToLiquidate$principalTypes, c("Non-Stable,Stable", "Non-Stable", "Stable"))
+
+loanDataTimeToLiquidate$collateralTypes <- as.factor(loanDataTimeToLiquidate$collateralTypes)
+
+loanDataTimeToLiquidate$collateralTypes <- fct_relevel(loanDataTimeToLiquidate$collateralTypes, c("Non-Stable,Stable", "Non-Stable", "Stable"))
+
+loanDataTimeToLiquidate <- loanDataTimeToLiquidate %>%
+  mutate(principalStable = (principalTypes == "Stable" | principalTypes == "Non-Stable,Stable"), principalNonStable = (principalTypes == "Non-Stable" | principalTypes == "Non-Stable,Stable")) %>%
+  mutate(collateralStable = (collateralTypes == "Stable" | collateralTypes == "Non-Stable,Stable"), collateralNonStable = (collateralTypes == "Non-Stable" | collateralTypes == "Non-Stable,Stable"))
+
+
+loanDataTimeToLiquidate <- loanDataTimeToLiquidate %>%
+  mutate(timeDiffDays = as.numeric(timeDiff/86400)) %>%
+  mutate(timeDiffWeeks = as.numeric(timeDiffDays/7))
+km_fitTimeToLiquidate <- survfit(Surv(timeDiffDays, as.numeric(status)) ~ liquidationType2, data=loanDataTimeToLiquidate)
+
+originalCoxFit <- coxph(Surv(timeDiffDays, as.numeric(status)) ~ liquidationType, data = loanDataTimeToLiquidate)
+originalCoxFit
+
+loanDataTimeToLiquidate$liquidationType2 <- as.factor(loanDataTimeToLiquidate$liquidationType2)
+
+
+coxFit <- coxph(Surv(timeDiffDays, as.numeric(status)) ~ liquidationType2, data = loanDataTimeToLiquidate)
+coxFit
+
+coxFitWithInteractionTerm <- coxph(Surv(timeDiffDays, as.numeric(status)) ~ principalStable*collateralStable + principalStable*collateralNonStable + principalNonStable*collateralStable + principalNonStable*collateralNonStable, data = loanDataTimeToLiquidate)
+coxFitWithInteractionTerm
+
+kmPlotTimeToLiquidate <- ggsurvplot(km_fitTimeToLiquidate, xlab="Time (Days)", ylab="Probability of No Liquidation", legend.title="Principal:Collateral", censor=FALSE, conf.int = TRUE, legend=c(0.8,0.6), legend.labs = c("Non-Stable: Non-Stable (9.43%)", "Non-Stable: Mixed (0.24%)", "Non-Stable: Stable (1.62%)", "Stable: Non-Stable (86.64%)", "Stable: Mixed (0.83%)", "Stable: Stable (1.22%)"), pval = TRUE)
+
+kmPlotTimeToLiquidate
+```
+
+## Build features to cluster the users:
+```{r}
+timeFinal <- max(df$timestamp)
+userActiveTime <- df %>%
+  group_by(user) %>%
+  dplyr::summarise(firstTransactionTimestamp = min(timestamp), finalTimestamp = max(timestamp), daysSinceFirstTransaction = max((timeFinal-min(timestamp))/86400, 1))
+
+userDailyTransactions <- df %>%
+  group_by(user) %>%
+  mutate(transactionDay = floor_date(as_datetime(timestamp), unit = "day")) %>%
+  group_by(user, transactionDay) %>%
+  dplyr::summarise(transactionsPerActiveDay = n())
+
+userActiveDays <- userDailyTransactions %>%
+  group_by(user) %>%
+  dplyr::summarise(activeDays = n())
+
+userBorrowCounts <- borrows %>%
+  group_by(user) %>%
+  dplyr::summarise(borrowCount = n(), borrowValue = sum(amountUSD))
+
+userDepositCounts <- deposits %>%
+  group_by(user) %>%
+  dplyr::summarise(depositCount = n(), depositValue = sum(amountUSD))
+
+userRedeemCounts <- redeems %>%
+  group_by(user) %>%
+  dplyr::summarise(redeemCount = n(), redeemValue = sum(amountUSD))
+
+userRepayCounts <- repays %>%
+  group_by(user) %>%
+  dplyr::summarise(repayCount = n(), repayValue = sum(amountUSD))
+
+userLiquidatedCounts <- aggregateLiquidations %>%
+  group_by(user) %>%
+  dplyr::summarise(liquidatedCount = n(), liquidatedValue = sum(totalPrincipalUSD))
+
+userLiquidationCounts <- liquidationsPerformed %>%
+  group_by(user) %>%
+  dplyr::summarise(liquidationsPerformed = n(), liquidationsPerformedValue = sum(amountUSDCollateral))
+
+userSwapCounts <- swaps %>%
+  group_by(user) %>%
+  dplyr::summarise(swapCount = n())
+
+userCollateralCounts <- collaterals %>%
+  group_by(user) %>%
+  dplyr::summarise(collateralCount = n())
+
+userReservesUsed <- df %>%
+  filter(type == "deposit" | type == "borrow") %>%
+  group_by(user) %>%
+  dplyr::summarise(reservesUsed = n_distinct(reserve))
+
+transactionsMadeOnBehalfOf <- df %>%
+  filter(user != onBehalfOf & protocolContract == FALSE) %>%
+  select(onBehalfOf) %>%
+  rename(user = onBehalfOf) %>%
+  group_by(user) %>%
+  summarise(onBehalfOfCount = n())
+  
+transactionsPerformedForOther <- df %>%
+  filter(user != onBehalfOf & protocolContract == FALSE) %>%
+  select(user) %>%
+  group_by(user) %>%
+  summarise(performedForOtherCount = n())
+
+
+userTransactionCounts <- df %>%
+  select(user, protocolContract) %>%
+  distinct() %>%
+  full_join(userBorrowCounts, by = "user") %>%
+  full_join(userDepositCounts, by = "user") %>%
+  full_join(userRedeemCounts, by = "user") %>%
+  full_join(userRepayCounts, by = "user") %>%
+  full_join(userLiquidatedCounts, by = "user") %>%
+  full_join(userLiquidationCounts, by = "user") %>%
+  full_join(userSwapCounts, by = "user") %>%
+  full_join(userCollateralCounts, by = "user")
+
+userTransactionCounts[is.na(userTransactionCounts)] = 0
+
+userTransactionCounts <- userTransactionCounts %>%
+  mutate(totalTransactionCount = borrowCount + depositCount + redeemCount + repayCount + liquidatedCount + liquidationsPerformed + swapCount + collateralCount)
+
+userActiveCollaterals <- collaterals %>%
+  group_by(user, reserve) %>%
+  slice_max(timestamp) %>%
+  filter(toState == TRUE) %>%
+  ungroup() %>%
+  group_by(user) %>%
+  dplyr::summarise(numActiveCollaterals=n())
+
+userClusteringData <- userTransactionCounts %>%
+  mutate(percentDepositRedeem = (depositCount + redeemCount) / totalTransactionCount) %>%
+  mutate(averageUSDPerTransaction = (depositValue + redeemValue + repayValue + liquidatedValue + liquidationsPerformedValue + borrowValue) / totalTransactionCount) %>%
+  mutate(timesLiquidated = liquidatedCount) %>%
+  mutate(liquidationsPerformed = liquidationsPerformed) %>%
+  left_join(userActiveTime, by="user") %>%
+  mutate(averageTransactionsPerDay = totalTransactionCount / daysSinceFirstTransaction) %>%
+  left_join(userActiveDays, by="user") %>%
+  mutate(percentageDaysActive = activeDays / daysSinceFirstTransaction) %>%
+  left_join(userReservesUsed, by = "user") %>%
+  left_join(userActiveCollaterals, by="user") %>%
+  mutate(percentDeposit = depositCount / totalTransactionCount, percentRedeems = redeemCount / totalTransactionCount, 
+         percentBorrow = borrowCount / totalTransactionCount, percentRepay = repayCount / totalTransactionCount,
+         percentSwap = swapCount / totalTransactionCount, percentCollateral = collateralCount / totalTransactionCount,
+         percentLiquidations = liquidationsPerformed / totalTransactionCount) %>%
+  left_join(transactionsOnBehalfOf, by="user") %>%
+  left_join(transactionsPerformedForOther, by = "user")
+  
+userClusteringData[is.na(userClusteringData)] = 0
+```
+
+```{r}
+library(factoextra)
+library(cluster)
+library(fclust)
+library(ppclust)
+library(e1071)
+
+# First, let's select the features we want to use:
+clusteringFeatures <- userClusteringData %>%
+  filter(protocolContract == FALSE) %>%
+  select(percentDepositRedeem, averageUSDPerTransaction, timesLiquidated, liquidationsPerformed, averageTransactionsPerDay, percentageDaysActive, reservesUsed, collateralCount, onBehalfOfCount, performedForOtherCount)
+
+scaledData <- clusteringFeatures %>% mutate_all(scale)
+
+fuzzyCMeans <- cmeans(data.matrix(scaledData), 4, iter.max = 1000, m = 4)
+
+userClusters <- userClusteringData %>%
+  filter(protocolContract == FALSE) %>%
+  bind_cols(fuzzyCMeans$cluster)%>%
+  dplyr::rename(cluster = `...38`) %>%
+  select(user, cluster)
+
+```
+
+## Add the user clusters from fuzzyCMeans to the data and see how survival curves change by cluster
+
+```{r}
+loanDataTimeToRepayClustered <- loanDataTimeToRepay %>%
+  left_join(userClusters, by = "user")
+
+loanCountReserveClustered <- loanDataTimeToRepayClustered %>%
+  dplyr::count(reserve) %>%
+  arrange(-n)
+
+loanDataClustered <- loanDataTimeToRepayClustered %>%
+  left_join(reserveTypes)
+
+km_fitClustered <- survfit(Surv(as.numeric(timeDiff/86400), as.numeric(status)) ~ cluster, data=loanDataClustered)
+
+kmPlotClustered <- ggsurvplot(km_fitClustered, xlab="Time (days)", ylab="Probability of No Repays", title="How Long Do Users Wait to Repay Loans?", legend.title="", censor=FALSE, conf.int = FALSE)
+
+kmPlotClustered
+```
